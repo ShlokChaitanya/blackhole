@@ -68,30 +68,39 @@ const CinematicBlackHoleShader = {
       return f;
     }
 
+    // Novikov-Thorne Thin Disk Temperature Profile
+    float diskTemperature(float r, float isco, float outerEdge) {
+      if(r < isco || r > outerEdge) return 0.0;
+      // Normalization factor based on mass and accretion rate
+      // F(r) ~ (1 - sqrt(isco/r)) / r^3
+      float f = 1.0 - sqrt(isco / r);
+      float flux = f / pow(r, 3.0);
+      return pow(max(0.0, flux), 0.25) * uAccretionRate; // Returns normalized T
+    }
+
     // Disk density function
     float diskDensity(vec3 p, float isco, float outerEdge) {
       float r = length(p.xz);
       if(r < isco || r > outerEdge) return 0.0;
       
-      // vertical falloff
+      // vertical falloff (geometrically thin disk)
       float h = abs(p.y);
-      float maxH = 0.5 + (r - isco) * 0.1;
+      float maxH = 0.05 + (r - isco) * 0.02; // Thin disk
       if (h > maxH) return 0.0;
       
       float vDensity = 1.0 - (h / maxH);
+      float rDensity = smoothstep(isco, isco + 0.5, r) * smoothstep(outerEdge, outerEdge - 5.0, r);
       
-      // Radial falloff
-      float rDensity = smoothstep(isco, isco + 2.0, r) * smoothstep(outerEdge, outerEdge - 5.0, r);
-      
-      // Spiral noise
+      // Fine fluid turbulence instead of chunky FBM
       float theta = atan(p.z, p.x);
-      float omega = sqrt(uMass / pow(r, 3.0));
-      float angle = theta - uTime * omega * 3.0;
+      // Keplerian angular velocity in Kerr: Omega = 1 / (r^(3/2) + a)
+      float omega = 1.0 / (pow(r, 1.5) + uSpin * uMass);
+      float angle = theta - uTime * omega * 2.0;
       
-      float n = fbm(vec3(r * 0.5, angle * 4.0, uTime * 0.2));
-      float lanes = smoothstep(0.3, 0.7, n);
+      float n = fbm(vec3(r * 2.0, angle * 5.0, uTime * 0.5));
+      float lanes = smoothstep(0.4, 0.6, n);
       
-      return vDensity * rDensity * lanes * uAccretionRate;
+      return vDensity * rDensity * (0.5 + 0.5 * lanes);
     }
 
     void main() {
@@ -114,7 +123,7 @@ const CinematicBlackHoleShader = {
       float minR = 10000.0;
 
       // We march the ray forward. If lensing is on, we curve it.
-      for(int i = 0; i < 200; i++) {
+      for(int i = 0; i < 300; i++) {
         float r2 = dot(rayPos, rayPos);
         float r = sqrt(r2);
         
@@ -126,41 +135,67 @@ const CinematicBlackHoleShader = {
         }
         
         // Adaptive step size based on distance to black hole.
-        // Smaller steps near the event horizon create a razor-sharp edge!
-        dt = max(0.015, (r - Rs) * 0.15);
+        dt = max(0.01, (r - Rs) * 0.1);
 
-        // Gravity bending
+        // Gravity bending using precise null geodesic equations
         if (uShowLensing > 0.5) {
-          // Acceleration a = -1.5 * Rs * L^2 * pos / r^5  (approximation for light)
-          // For simplicity, we use a basic inward pull that roughly matches Schwarzschild
-          vec3 pull = -rayPos * (Rs * 0.8 / (r2 * r));
-          rayDir += pull * dt;
+          // Exact Schwarzschild null geodesic acceleration in Cartesian:
+          // a = -1.5 * Rs * |L|^2 / r^5 * pos
+          vec3 L = cross(rayPos, rayDir);
+          float L2 = dot(L, L);
+          vec3 a_grav = -1.5 * Rs * L2 / (r2 * r2 * r) * rayPos;
+          
+          // Lense-Thirring frame dragging (Spin approximation)
+          // J = spin * M^2. Dipole-like magnetic field effect on ray.
+          if (uSpin > 0.01) {
+             vec3 J = vec3(0.0, uSpin * uMass * uMass, 0.0);
+             vec3 a_LT = 2.0 * cross(J, rayDir) / (r2 * r) - 3.0 * dot(J, rayPos) * cross(rayPos, rayDir) / (r2 * r2 * r);
+             a_grav += a_LT * 5.0; // Boosted slightly for visual effect
+          }
+
+          // Symplectic Euler integration
+          rayDir += a_grav * dt;
           rayDir = normalize(rayDir);
         }
 
-        // Sample Accretion Disk
-        if (uShowDisk > 0.5 && abs(rayPos.y) < 5.0 && r < outerEdge && r > isco) {
+        // Sample Accretion Disk using GRRT (Module 13, 14, 16)
+        if (uShowDisk > 0.5 && abs(rayPos.y) < 1.0 && r < outerEdge && r > isco) {
           float density = diskDensity(rayPos, isco, outerEdge);
           if (density > 0.0) {
-            // Temperature mapping
-            float t_norm = (r - isco) / (outerEdge - isco);
-            vec3 hotColor = vec3(1.0, 0.8, 0.4);
-            vec3 midColor = vec3(1.0, 0.3, 0.05);
-            vec3 coldColor = vec3(0.2, 0.0, 0.0);
+            float T = diskTemperature(r, isco, outerEdge);
             
-            vec3 emit = mix(midColor, hotColor, smoothstep(0.1, 0.0, t_norm));
-            emit = mix(coldColor, emit, smoothstep(0.8, 0.3, t_norm));
-            
-            // Doppler beaming
+            // Relativistic Doppler Shift (Module 16)
+            // Fluid 4-velocity u^mu Keplerian in Kerr
             float theta = atan(rayPos.z, rayPos.x);
-            vec3 vel = vec3(-sin(theta), 0.0, cos(theta));
-            float doppler = dot(vel, -rayDir) * sqrt(uMass / r) * 1.5;
-            float beaming = pow(max(1.0 + doppler, 0.0), 3.0);
+            float omega = 1.0 / (pow(r, 1.5) + uSpin * uMass);
+            vec3 vel = vec3(-sin(theta), 0.0, cos(theta)) * omega * r;
             
-            emit *= beaming * density * 2.0 * dt;
+            // Lorentz factor
+            float gamma = 1.0 / sqrt(max(0.001, 1.0 - dot(vel, vel)));
+            
+            // Doppler factor g = 1 / (gamma * (1 - dot(v, n)))
+            float doppler = 1.0 / (gamma * (1.0 - dot(vel, -rayDir)));
+            
+            // Beaming factor is g^3 for intensity (I_nu / nu^3 invariant)
+            float beaming = pow(doppler, 3.0);
+            
+            // Map temperature to color (Planck-like)
+            vec3 hotColor = vec3(1.0, 0.9, 1.0); // X-ray/UV
+            vec3 midColor = vec3(1.0, 0.4, 0.1); // Visible
+            vec3 coldColor = vec3(0.2, 0.0, 0.0); // Infrared
+            
+            float t_norm = min(1.0, T * 2.0); // Normalize T
+            vec3 emit = mix(coldColor, midColor, smoothstep(0.0, 0.5, t_norm));
+            emit = mix(emit, hotColor, smoothstep(0.5, 1.0, t_norm));
+            
+            // Gravitational Redshift (Module 17)
+            float z_grav = sqrt(1.0 - Rs/r); 
+            emit *= z_grav; // Dimming due to climbing out of potential well
+            
+            emit *= beaming * density * 5.0 * dt;
             
             color += emit * transmittance;
-            transmittance *= exp(-density * 5.0 * dt);
+            transmittance *= exp(-density * 10.0 * dt);
           }
         }
         
